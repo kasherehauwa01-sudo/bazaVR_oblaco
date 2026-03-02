@@ -33,8 +33,10 @@ def add_log(message: str) -> None:
 def load_table(file_obj) -> pd.DataFrame:
     """Читает HTML и возвращает первую таблицу с нужными колонками.
 
-    Поддерживает fallback, если в окружении отсутствует lxml:
-    пробует сначала стандартный парсер, затем bs4/html5lib.
+    Логика:
+    - сначала определяем доступные зависимости для pandas.read_html;
+    - если парсеров нет, показываем одно понятное сообщение без каскада ошибок;
+    - если парсеры есть, пробуем их по приоритету.
     """
     try:
         raw_bytes = file_obj.getvalue()
@@ -44,26 +46,41 @@ def load_table(file_obj) -> pd.DataFrame:
         st.error("Не удалось прочитать содержимое HTML-файла.")
         return pd.DataFrame()
 
-    parser_attempts: list[tuple[str, dict]] = [
-        ("lxml/auto", {}),
-        ("bs4", {"flavor": "bs4"}),
-        ("html5lib", {"flavor": "html5lib"}),
-    ]
+    # Проверяем, какие парсеры реально доступны в окружении.
+    # Для flavor='bs4' и flavor='html5lib' pandas требует html5lib.
+    import importlib.util
+
+    has_lxml = importlib.util.find_spec("lxml") is not None
+    has_html5lib = importlib.util.find_spec("html5lib") is not None
+
+    parser_attempts: list[tuple[str, dict]] = []
+    if has_lxml:
+        parser_attempts.append(("lxml", {"flavor": "lxml"}))
+    if has_html5lib:
+        parser_attempts.append(("bs4/html5lib", {"flavor": "bs4"}))
+
+    if not parser_attempts:
+        message = (
+            "Не удалось прочитать HTML: в окружении нет поддерживаемых парсеров для pandas.read_html "
+            "(нужен lxml или html5lib)."
+        )
+        add_log(message)
+        st.error(message)
+        return pd.DataFrame()
 
     tables: list[pd.DataFrame] = []
     last_error: Exception | None = None
     for parser_name, parser_kwargs in parser_attempts:
         try:
             tables = pd.read_html(html_text, **parser_kwargs)
-            if parser_name != "lxml/auto":
-                add_log(f"Чтение HTML выполнено через fallback-парсер: {parser_name}")
+            add_log(f"Чтение HTML выполнено парсером: {parser_name}")
             break
         except Exception as exc:
             last_error = exc
             add_log(f"Ошибка чтения HTML ({parser_name}): {exc}")
 
     if not tables:
-        st.error("Не удалось прочитать HTML-файл. Проверьте структуру таблицы и доступные парсеры.")
+        st.error("Не удалось прочитать HTML-файл. Проверьте структуру таблицы.")
         if last_error is not None:
             add_log(f"Критическая ошибка чтения HTML: {last_error}")
         return pd.DataFrame()
