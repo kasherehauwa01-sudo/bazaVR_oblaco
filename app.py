@@ -247,21 +247,26 @@ def format_birthday_for_display(series: pd.Series) -> pd.Series:
 def make_xlsx_bytes(df: pd.DataFrame) -> bytes | None:
     """Готовит Excel-файл в памяти.
 
-    Возвращает None, если в окружении отсутствует openpyxl или произошла ошибка экспорта.
+    Сначала пробует engine=openpyxl, затем fallback на engine=xlsxwriter.
+    Возвращает None, если оба движка недоступны или произошла ошибка экспорта.
     """
-    output = BytesIO()
-    try:
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Клиенты")
-    except ModuleNotFoundError as exc:
-        add_log(f"Ошибка экспорта XLSX: отсутствует зависимость ({exc})")
-        return None
-    except Exception as exc:
-        add_log(f"Ошибка экспорта XLSX: {exc}")
-        return None
+    errors: list[str] = []
 
-    output.seek(0)
-    return output.getvalue()
+    for engine in ("openpyxl", "xlsxwriter"):
+        output = BytesIO()
+        try:
+            with pd.ExcelWriter(output, engine=engine) as writer:
+                df.to_excel(writer, index=False, sheet_name="Клиенты")
+            output.seek(0)
+            add_log(f"Экспорт XLSX выполнен через движок: {engine}")
+            return output.getvalue()
+        except ModuleNotFoundError as exc:
+            errors.append(f"{engine}: {exc}")
+        except Exception as exc:
+            errors.append(f"{engine}: {exc}")
+
+    add_log("Ошибка экспорта XLSX: недоступны движки openpyxl/xlsxwriter. " + " | ".join(errors))
+    return None
 
 
 def main() -> None:
@@ -360,7 +365,7 @@ def main() -> None:
 
     xlsx_data = make_xlsx_bytes(display_df)
     if xlsx_data is None:
-        st.warning("Экспорт XLSX временно недоступен: в окружении не установлен openpyxl.")
+        st.warning("Экспорт XLSX временно недоступен: не найдены движки openpyxl/xlsxwriter.")
     else:
         st.download_button(
             label="Скачать xlsx",
