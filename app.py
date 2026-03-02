@@ -236,11 +236,30 @@ def apply_filters(
     return filtered
 
 
-def make_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    """Готовит Excel-файл в памяти."""
+def format_birthday_for_display(series: pd.Series) -> pd.Series:
+    """Форматирует ДР для отображения в виде дд.мм.гггг."""
+    parsed = pd.to_datetime(series, dayfirst=True, errors="coerce")
+    formatted = parsed.dt.strftime("%d.%m.%Y")
+    # Если дату распарсить не удалось, сохраняем исходное значение.
+    return formatted.where(parsed.notna(), series.astype(str))
+
+
+def make_xlsx_bytes(df: pd.DataFrame) -> bytes | None:
+    """Готовит Excel-файл в памяти.
+
+    Возвращает None, если в окружении отсутствует openpyxl или произошла ошибка экспорта.
+    """
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Клиенты")
+    try:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Клиенты")
+    except ModuleNotFoundError as exc:
+        add_log(f"Ошибка экспорта XLSX: отсутствует зависимость ({exc})")
+        return None
+    except Exception as exc:
+        add_log(f"Ошибка экспорта XLSX: {exc}")
+        return None
+
     output.seek(0)
     return output.getvalue()
 
@@ -275,12 +294,43 @@ def main() -> None:
         only_with_email = st.checkbox("Показывать только клиентов с Email", value=False)
 
         use_birthday_discount = st.checkbox("Скидка в день рождения", value=False)
-        selected_day_month = st.date_input(
-            "Выберите дату (дд.мм)",
-            value=date.today(),
-            format="DD.MM.YYYY",
+
+        months = {
+            "01": "01 — Январь",
+            "02": "02 — Февраль",
+            "03": "03 — Март",
+            "04": "04 — Апрель",
+            "05": "05 — Май",
+            "06": "06 — Июнь",
+            "07": "07 — Июль",
+            "08": "08 — Август",
+            "09": "09 — Сентябрь",
+            "10": "10 — Октябрь",
+            "11": "11 — Ноябрь",
+            "12": "12 — Декабрь",
+        }
+
+        default_month = f"{date.today().month:02d}"
+        selected_month_code = st.selectbox(
+            "Выберите месяц",
+            options=list(months.keys()),
+            index=list(months.keys()).index(default_month),
+            format_func=lambda x: months[x],
             disabled=not use_birthday_discount,
         )
+
+        # Используем високосный эталонный год, чтобы поддержать 29 февраля.
+        max_day = pd.Timestamp(year=2000, month=int(selected_month_code), day=1).days_in_month
+        default_day = min(date.today().day, max_day)
+        selected_day = st.selectbox(
+            "Выберите день",
+            options=list(range(1, max_day + 1)),
+            index=default_day - 1,
+            format_func=lambda x: f"{x:02d}",
+            disabled=not use_birthday_discount,
+        )
+
+        selected_day_month = date(2000, int(selected_month_code), int(selected_day))
 
         sms_consent = st.checkbox("Согласен на СМС", value=False)
         email_consent = st.checkbox("Согласен на Email", value=False)
@@ -303,15 +353,21 @@ def main() -> None:
     st.markdown(f"**Количество строк после фильтров:** {len(filtered_df)}")
 
     display_df = filtered_df.reindex(columns=PREVIEW_COLUMNS)
+    if "ДР" in display_df.columns:
+        display_df["ДР"] = format_birthday_for_display(display_df["ДР"])
+
     st.dataframe(display_df, use_container_width=True)
 
     xlsx_data = make_xlsx_bytes(display_df)
-    st.download_button(
-        label="Скачать xlsx",
-        data=xlsx_data,
-        file_name="filtered_clients.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if xlsx_data is None:
+        st.warning("Экспорт XLSX временно недоступен: в окружении не установлен openpyxl.")
+    else:
+        st.download_button(
+            label="Скачать xlsx",
+            data=xlsx_data,
+            file_name="filtered_clients.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     with st.expander("Логи"):
         st.text("\n".join(st.session_state.logs) if st.session_state.logs else "Логи пока пусты")
