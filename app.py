@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import date
+from html import unescape
+from html.parser import HTMLParser
 from io import BytesIO
 
 import numpy as np
@@ -19,6 +21,78 @@ INN_TO_DEPARTMENT = {
 }
 
 
+class _SimpleHTMLTableParser(HTMLParser):
+    """Простой парсер HTML-таблиц без внешних зависимостей."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self._in_table = False
+        self._in_row = False
+        self._in_cell = False
+        self._current_table: list[list[str]] = []
+        self._current_row: list[str] = []
+        self._current_cell_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            self._in_table = True
+            self._current_table = []
+        elif self._in_table and tag == "tr":
+            self._in_row = True
+            self._current_row = []
+        elif self._in_row and tag in {"td", "th"}:
+            self._in_cell = True
+            self._current_cell_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._current_cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"td", "th"} and self._in_cell:
+            cell_text = unescape("".join(self._current_cell_parts)).strip()
+            self._current_row.append(cell_text)
+            self._in_cell = False
+            self._current_cell_parts = []
+        elif tag == "tr" and self._in_row:
+            if self._current_row:
+                self._current_table.append(self._current_row)
+            self._current_row = []
+            self._in_row = False
+        elif tag == "table" and self._in_table:
+            self.tables.append(self._current_table)
+            self._current_table = []
+            self._in_table = False
+
+
+def _read_html_without_dependencies(html_text: str) -> list[pd.DataFrame]:
+    """Читает таблицы из HTML через встроенный html.parser, если pandas.read_html недоступен."""
+    parser = _SimpleHTMLTableParser()
+    parser.feed(html_text)
+
+    dataframes: list[pd.DataFrame] = []
+    for raw_table in parser.tables:
+        rows = [row for row in raw_table if any(str(cell).strip() for cell in row)]
+        if len(rows) < 2:
+            continue
+
+        max_len = max(len(row) for row in rows)
+        normalized_rows = [row + [""] * (max_len - len(row)) for row in rows]
+
+        header = [str(col).strip() for col in normalized_rows[0]]
+        body = normalized_rows[1:]
+        if not body:
+            continue
+
+        df = pd.DataFrame(body, columns=header)
+        dataframes.append(df)
+
+    return dataframes
+
+
 def init_logs() -> None:
     """Инициализация хранилища логов в session_state."""
     if "logs" not in st.session_state:
@@ -34,9 +108,9 @@ def load_table(file_obj) -> pd.DataFrame:
     """Читает HTML и возвращает первую таблицу с нужными колонками.
 
     Логика:
-    - сначала определяем доступные зависимости для pandas.read_html;
-    - если парсеров нет, показываем одно понятное сообщение без каскада ошибок;
-    - если парсеры есть, пробуем их по приоритету.
+    - пробуем pandas.read_html доступными парсерами (lxml/html5lib);
+    - если внешние парсеры недоступны, используем встроенный fallback-парсер;
+    - выбираем первую таблицу, содержащую все обязательные колонки.
     """
     try:
         raw_bytes = file_obj.getvalue()
@@ -46,8 +120,6 @@ def load_table(file_obj) -> pd.DataFrame:
         st.error("Не удалось прочитать содержимое HTML-файла.")
         return pd.DataFrame()
 
-    # Проверяем, какие парсеры реально доступны в окружении.
-    # Для flavor='bs4' и flavor='html5lib' pandas требует html5lib.
     import importlib.util
 
     has_lxml = importlib.util.find_spec("lxml") is not None
@@ -59,17 +131,9 @@ def load_table(file_obj) -> pd.DataFrame:
     if has_html5lib:
         parser_attempts.append(("bs4/html5lib", {"flavor": "bs4"}))
 
-    if not parser_attempts:
-        message = (
-            "Не удалось прочитать HTML: в окружении нет поддерживаемых парсеров для pandas.read_html "
-            "(нужен lxml или html5lib)."
-        )
-        add_log(message)
-        st.error(message)
-        return pd.DataFrame()
-
     tables: list[pd.DataFrame] = []
     last_error: Exception | None = None
+
     for parser_name, parser_kwargs in parser_attempts:
         try:
             tables = pd.read_html(html_text, **parser_kwargs)
@@ -78,6 +142,14 @@ def load_table(file_obj) -> pd.DataFrame:
         except Exception as exc:
             last_error = exc
             add_log(f"Ошибка чтения HTML ({parser_name}): {exc}")
+
+    if not tables:
+        try:
+            tables = _read_html_without_dependencies(html_text)
+            if tables:
+                add_log("Чтение HTML выполнено встроенным fallback-парсером (без внешних зависимостей)")
+        except Exception as exc:
+            add_log(f"Ошибка встроенного fallback-парсера HTML: {exc}")
 
     if not tables:
         st.error("Не удалось прочитать HTML-файл. Проверьте структуру таблицы.")
