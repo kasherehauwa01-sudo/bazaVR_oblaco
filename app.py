@@ -176,7 +176,7 @@ def build_department(df: pd.DataFrame) -> pd.DataFrame:
 
     В одной ячейке ИНН может быть несколько значений, разделённых пробелом.
     В этом случае возвращаем несколько подразделений в той же последовательности,
-    разделяя их пробелом.
+    разделяя их через " | ", чтобы можно было корректно фильтровать по отдельным подразделениям.
     """
     result = df.copy()
 
@@ -186,7 +186,9 @@ def build_department(df: pd.DataFrame) -> pd.DataFrame:
             return "Не определено"
 
         departments = [INN_TO_DEPARTMENT.get(part, "Не определено") for part in parts]
-        return " ".join(departments)
+        # Убираем повторы, сохраняя исходный порядок.
+        unique_departments = list(dict.fromkeys(departments))
+        return " | ".join(unique_departments)
 
     result["Подразделение"] = result["ИНН"].apply(map_inn_to_department)
     return result
@@ -245,7 +247,14 @@ def apply_filters(
         add_log(f"Фильтр 'согласен на Email': осталось {len(filtered)} строк")
 
     if selected_departments:
-        filtered = filtered[filtered["Подразделение"].isin(selected_departments)]
+        selected_set = set(selected_departments)
+
+        def has_selected_department(value: object) -> bool:
+            parts = [part.strip() for part in str(value).split("|") if part.strip()]
+            return bool(selected_set.intersection(parts))
+
+        dep_mask = filtered["Подразделение"].apply(has_selected_department)
+        filtered = filtered[dep_mask]
         add_log(f"Фильтр 'подразделение': осталось {len(filtered)} строк")
 
     return filtered
@@ -452,7 +461,7 @@ def main() -> None:
         email_consent = st.checkbox("Согласен на Email", value=False)
 
     with col2:
-        departments = sorted(df["Подразделение"].dropna().unique().tolist())
+        departments = list(INN_TO_DEPARTMENT.values())
         selected_departments = st.multiselect("Выбор подразделения", options=departments, default=departments)
 
     filtered_df = apply_filters(
