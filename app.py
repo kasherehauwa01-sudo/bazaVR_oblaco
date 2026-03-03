@@ -8,6 +8,7 @@ from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 import re
 from urllib.parse import urljoin
+import time
 
 import numpy as np
 import pandas as pd
@@ -110,6 +111,26 @@ def _extract_attr(tag: str, attr_name: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _request_with_retries(session, method: str, url: str, *, data=None, attempts: int = 3, timeout=(15, 90)):
+    """Выполняет HTTP-запрос с повторами и нарастающей паузой."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.request(method=method, url=url, data=data, timeout=timeout)
+            response.raise_for_status()
+            if attempt > 1:
+                add_log(f"HTTP {method} {url}: успешно с попытки {attempt}")
+            return response
+        except Exception as exc:
+            last_exc = exc
+            add_log(f"HTTP {method} {url}: попытка {attempt}/{attempts} завершилась ошибкой ({exc})")
+            if attempt < attempts:
+                time.sleep(1.5 * attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Неизвестная ошибка HTTP-запроса")
+
+
 def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
     """Подключается к удалённой странице, логинится и возвращает таблицу клиентов."""
     try:
@@ -124,8 +145,7 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
 
     try:
         session = requests.Session()
-        response = session.get(DB_CLIENTS_URL, timeout=30)
-        response.raise_for_status()
+        response = _request_with_retries(session, "GET", DB_CLIENTS_URL, attempts=3, timeout=(15, 90))
         login_html = response.text
     except Exception as exc:
         add_log(f"Ошибка подключения к БД: не удалось открыть страницу ({exc})")
@@ -189,23 +209,21 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
     status_placeholder.info("Шаг 3/5: выполняем авторизацию...")
 
     try:
-        auth_response = session.post(login_url, data=payload, timeout=30)
-        auth_response.raise_for_status()
+        _request_with_retries(session, "POST", login_url, data=payload, attempts=3, timeout=(15, 120))
     except Exception as exc:
         add_log(f"Ошибка подключения к БД: не удалось выполнить вход ({exc})")
-        st.error("Не удалось выполнить вход в БД.")
+        st.error("Не удалось выполнить вход в БД (таймаут или ошибка сети).")
         return pd.DataFrame()
 
     progress_bar.progress(75)
     status_placeholder.info("Шаг 4/5: загружаем таблицу клиентов...")
 
     try:
-        clients_response = session.get(DB_CLIENTS_URL, timeout=60)
-        clients_response.raise_for_status()
+        clients_response = _request_with_retries(session, "GET", DB_CLIENTS_URL, attempts=3, timeout=(15, 120))
         html_text = clients_response.text
     except Exception as exc:
         add_log(f"Ошибка подключения к БД: не удалось загрузить таблицу ({exc})")
-        st.error("Не удалось загрузить страницу таблицы клиентов.")
+        st.error("Не удалось загрузить страницу таблицы клиентов (таймаут или ошибка сети).")
         return pd.DataFrame()
 
     class _MemoryFile:
