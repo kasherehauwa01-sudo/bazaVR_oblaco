@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from html import unescape
 from html.parser import HTMLParser
 from io import BytesIO
@@ -111,27 +111,30 @@ def _extract_attr(tag: str, attr_name: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _request_with_retries(session, method: str, url: str, *, data=None, attempts: int = 3, timeout=(15, 90)):
-    """Выполняет HTTP-запрос с повторами и нарастающей паузой."""
+def _request_with_retries(session, method: str, url: str, *, data=None, attempts: int = 2, timeout=(10, 40), base_sleep: float = 0.8):
+    """Выполняет HTTP-запрос с повторами и короткой нарастающей паузой."""
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
+            add_db_log(f"HTTP {method} {url}: попытка {attempt}/{attempts}")
             response = session.request(method=method, url=url, data=data, timeout=timeout)
             response.raise_for_status()
             if attempt > 1:
                 add_log(f"HTTP {method} {url}: успешно с попытки {attempt}")
+                add_db_log(f"HTTP {method} {url}: успешно с попытки {attempt}")
             return response
         except Exception as exc:
             last_exc = exc
             add_log(f"HTTP {method} {url}: попытка {attempt}/{attempts} завершилась ошибкой ({exc})")
+            add_db_log(f"HTTP {method} {url}: ошибка попытки {attempt} ({exc})")
             if attempt < attempts:
-                time.sleep(1.5 * attempt)
+                time.sleep(base_sleep * attempt)
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Неизвестная ошибка HTTP-запроса")
 
 
-def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
+def fetch_table_from_db(progress_bar, status_placeholder, db_log_placeholder) -> pd.DataFrame:
     """Подключается к удалённой странице, логинится и возвращает таблицу клиентов."""
     try:
         import requests
@@ -140,13 +143,20 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
         st.error("Не удалось подключиться к БД: отсутствует библиотека requests.")
         return pd.DataFrame()
 
+    add_db_log("Старт подключения к БД")
+    render_db_logs(db_log_placeholder)
+
     progress_bar.progress(5)
     status_placeholder.info("Шаг 1/5: открываем страницу авторизации...")
+    add_db_log("Шаг 1/5: запрос страницы авторизации")
+    render_db_logs(db_log_placeholder)
 
     try:
         session = requests.Session()
-        response = _request_with_retries(session, "GET", DB_CLIENTS_URL, attempts=3, timeout=(15, 90))
+        response = _request_with_retries(session, "GET", DB_CLIENTS_URL, attempts=2, timeout=(10, 35))
         login_html = response.text
+        add_db_log("Страница авторизации получена")
+        render_db_logs(db_log_placeholder)
     except Exception as exc:
         add_log(f"Ошибка подключения к БД: не удалось открыть страницу ({exc})")
         st.error("Не удалось открыть страницу БД.")
@@ -154,6 +164,8 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
 
     progress_bar.progress(25)
     status_placeholder.info("Шаг 2/5: подготавливаем форму входа...")
+    add_db_log("Шаг 2/5: анализ HTML-формы входа")
+    render_db_logs(db_log_placeholder)
 
     form_blocks = re.findall(r"<form[\s\S]*?</form>", login_html, flags=re.IGNORECASE)
     login_form = next((frm for frm in form_blocks if re.search(r'type\s*=\s*["\']password["\']', frm, flags=re.IGNORECASE)), None)
@@ -169,6 +181,8 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
     form_tag = form_tag_match.group(0) if form_tag_match else ""
     action = _extract_attr(form_tag, "action") or DB_CLIENTS_URL
     login_url = urljoin(DB_CLIENTS_URL, action)
+    add_db_log(f"Обнаружен action формы: {login_url}")
+    render_db_logs(db_log_placeholder)
 
     payload: dict[str, str] = {}
     username_field = None
@@ -207,9 +221,13 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
 
     progress_bar.progress(50)
     status_placeholder.info("Шаг 3/5: выполняем авторизацию...")
+    add_db_log("Шаг 3/5: отправка логина и пароля")
+    render_db_logs(db_log_placeholder)
 
     try:
-        _request_with_retries(session, "POST", login_url, data=payload, attempts=3, timeout=(15, 120))
+        _request_with_retries(session, "POST", login_url, data=payload, attempts=2, timeout=(10, 40))
+        add_db_log("Авторизация выполнена")
+        render_db_logs(db_log_placeholder)
     except Exception as exc:
         add_log(f"Ошибка подключения к БД: не удалось выполнить вход ({exc})")
         st.error("Не удалось выполнить вход в БД (таймаут или ошибка сети).")
@@ -217,10 +235,14 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
 
     progress_bar.progress(75)
     status_placeholder.info("Шаг 4/5: загружаем таблицу клиентов...")
+    add_db_log("Шаг 4/5: запрос страницы с таблицей клиентов")
+    render_db_logs(db_log_placeholder)
 
     try:
-        clients_response = _request_with_retries(session, "GET", DB_CLIENTS_URL, attempts=3, timeout=(15, 120))
+        clients_response = _request_with_retries(session, "GET", DB_CLIENTS_URL, attempts=2, timeout=(10, 40))
         html_text = clients_response.text
+        add_db_log("HTML страницы клиентов загружен")
+        render_db_logs(db_log_placeholder)
     except Exception as exc:
         add_log(f"Ошибка подключения к БД: не удалось загрузить таблицу ({exc})")
         st.error("Не удалось загрузить страницу таблицы клиентов (таймаут или ошибка сети).")
@@ -233,19 +255,41 @@ def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
         def getvalue(self) -> bytes:
             return self._content
 
+    add_db_log("Шаг 5/5: парсинг таблицы из HTML")
+    render_db_logs(db_log_placeholder)
     df = load_table(_MemoryFile(html_text.encode("utf-8", errors="ignore")))
     if not df.empty:
         add_log(f"Подключение к БД успешно: загружено строк {len(df)}")
+        add_db_log(f"Успешно: загружено строк {len(df)}")
+    else:
+        add_db_log("Таблица не извлечена из HTML")
+    render_db_logs(db_log_placeholder)
 
     progress_bar.progress(100)
     status_placeholder.success("Шаг 5/5: загрузка завершена")
     return df
 
 
+def add_db_log(message: str) -> None:
+    """Добавляет сообщение в отдельный лог подключения к БД с отметкой времени."""
+    if "db_logs" not in st.session_state:
+        st.session_state.db_logs = []
+    ts = datetime.now().strftime("%H:%M:%S")
+    st.session_state.db_logs.append(f"[{ts}] {message}")
+
+
+def render_db_logs(log_placeholder) -> None:
+    """Обновляет текстовый блок с логами подключения к БД."""
+    logs = st.session_state.get("db_logs", [])
+    log_placeholder.text("\n".join(logs) if logs else "Логи подключения пока пусты")
+
+
 def init_logs() -> None:
-    """Инициализация хранилища логов в session_state."""
+    """Инициализация хранилищ логов в session_state."""
     if "logs" not in st.session_state:
         st.session_state.logs = []
+    if "db_logs" not in st.session_state:
+        st.session_state.db_logs = []
 
 
 def add_log(message: str) -> None:
@@ -565,10 +609,16 @@ def main() -> None:
     uploaded_file = st.file_uploader("Загрузка HTML файла", type=["html", "htm"])
     connect_db_clicked = st.button("Подключиться к БД")
 
+    db_log_container = st.expander("Подробные логи подключения к БД", expanded=False)
+    db_log_placeholder = db_log_container.empty()
+    render_db_logs(db_log_placeholder)
+
     if connect_db_clicked:
+        st.session_state.db_logs = []
+        render_db_logs(db_log_placeholder)
         progress_bar = st.progress(0)
         status_placeholder = st.empty()
-        df_from_db = fetch_table_from_db(progress_bar, status_placeholder)
+        df_from_db = fetch_table_from_db(progress_bar, status_placeholder, db_log_placeholder)
         if not df_from_db.empty:
             st.session_state.df_from_db = df_from_db
 
