@@ -4,6 +4,8 @@ from datetime import date
 from html import unescape
 from html.parser import HTMLParser
 from io import BytesIO
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 import pandas as pd
@@ -244,11 +246,100 @@ def format_birthday_for_display(series: pd.Series) -> pd.Series:
     return formatted.where(parsed.notna(), series.astype(str))
 
 
+
+
+def _build_xlsx_without_external_engines(df: pd.DataFrame) -> bytes:
+    """Собирает минимальный XLSX (OOXML) без внешних библиотек."""
+
+    def col_name(idx: int) -> str:
+        name = ""
+        while idx > 0:
+            idx, rem = divmod(idx - 1, 26)
+            name = chr(65 + rem) + name
+        return name
+
+    rows_xml: list[str] = []
+
+    # Заголовок
+    header_cells = []
+    for c_idx, col in enumerate(df.columns, start=1):
+        ref = f"{col_name(c_idx)}1"
+        header_cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escape(str(col))}</t></is></c>')
+    rows_xml.append(f'<row r="1">{"".join(header_cells)}</row>')
+
+    # Данные
+    for r_idx, row in enumerate(df.itertuples(index=False, name=None), start=2):
+        cells = []
+        for c_idx, value in enumerate(row, start=1):
+            ref = f"{col_name(c_idx)}{r_idx}"
+            if pd.isna(value):
+                text = ""
+            else:
+                text = str(value)
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escape(text)}</t></is></c>')
+        rows_xml.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(rows_xml)}</sheetData>'
+        '</worksheet>'
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Клиенты" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+
+    rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '</Types>'
+    )
+
+    buffer = BytesIO()
+    with ZipFile(buffer, mode="w", compression=ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", rels_xml)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def make_xlsx_bytes(df: pd.DataFrame) -> bytes | None:
     """Готовит Excel-файл в памяти.
 
-    Сначала пробует engine=openpyxl, затем fallback на engine=xlsxwriter.
-    Возвращает None, если оба движка недоступны или произошла ошибка экспорта.
+    Приоритет: openpyxl -> xlsxwriter -> встроенный генератор XLSX без зависимостей.
     """
     errors: list[str] = []
 
@@ -265,7 +356,14 @@ def make_xlsx_bytes(df: pd.DataFrame) -> bytes | None:
         except Exception as exc:
             errors.append(f"{engine}: {exc}")
 
-    add_log("Ошибка экспорта XLSX: недоступны движки openpyxl/xlsxwriter. " + " | ".join(errors))
+    try:
+        data = _build_xlsx_without_external_engines(df)
+        add_log("Экспорт XLSX выполнен встроенным генератором без внешних зависимостей")
+        return data
+    except Exception as exc:
+        errors.append(f"builtin: {exc}")
+
+    add_log("Ошибка экспорта XLSX: " + " | ".join(errors))
     return None
 
 
@@ -365,7 +463,7 @@ def main() -> None:
 
     xlsx_data = make_xlsx_bytes(display_df)
     if xlsx_data is None:
-        st.warning("Экспорт XLSX временно недоступен: не найдены движки openpyxl/xlsxwriter.")
+        st.warning("Экспорт XLSX временно недоступен из-за ошибки генерации файла.")
     else:
         st.download_button(
             label="скачать xlsx",
