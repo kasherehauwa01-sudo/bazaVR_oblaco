@@ -172,10 +172,23 @@ def load_table(file_obj) -> pd.DataFrame:
 
 
 def build_department(df: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет колонку Подразделение на основе ИНН."""
+    """Добавляет колонку Подразделение на основе ИНН.
+
+    В одной ячейке ИНН может быть несколько значений, разделённых пробелом.
+    В этом случае возвращаем несколько подразделений в той же последовательности,
+    разделяя их пробелом.
+    """
     result = df.copy()
-    inn_clean = result["ИНН"].astype(str).str.strip()
-    result["Подразделение"] = inn_clean.map(INN_TO_DEPARTMENT).fillna("Не определено")
+
+    def map_inn_to_department(inn_value: object) -> str:
+        parts = [part.strip() for part in str(inn_value).split() if part.strip()]
+        if not parts:
+            return "Не определено"
+
+        departments = [INN_TO_DEPARTMENT.get(part, "Не определено") for part in parts]
+        return " ".join(departments)
+
+    result["Подразделение"] = result["ИНН"].apply(map_inn_to_department)
     return result
 
 
