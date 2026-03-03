@@ -7,6 +7,7 @@ from io import BytesIO
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 import re
+from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
@@ -24,6 +25,10 @@ INN_TO_DEPARTMENT = {
 }
 
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+DB_CLIENTS_URL = "https://cosmos-api.ru/clients/"
+DB_LOGIN = "manager"
+DB_PASSWORD = "Deg5ho.0999Z"
 
 
 class _SimpleHTMLTableParser(HTMLParser):
@@ -96,6 +101,127 @@ def _read_html_without_dependencies(html_text: str) -> list[pd.DataFrame]:
         dataframes.append(df)
 
     return dataframes
+
+
+def _extract_attr(tag: str, attr_name: str) -> str | None:
+    """Достаёт значение HTML-атрибута из тега через регулярное выражение."""
+    pattern = rf'{attr_name}\s*=\s*["\']([^"\']+)["\']'
+    match = re.search(pattern, tag, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def fetch_table_from_db(progress_bar, status_placeholder) -> pd.DataFrame:
+    """Подключается к удалённой странице, логинится и возвращает таблицу клиентов."""
+    try:
+        import requests
+    except Exception as exc:
+        add_log(f"Ошибка подключения к БД: не удалось импортировать requests ({exc})")
+        st.error("Не удалось подключиться к БД: отсутствует библиотека requests.")
+        return pd.DataFrame()
+
+    progress_bar.progress(5)
+    status_placeholder.info("Шаг 1/5: открываем страницу авторизации...")
+
+    try:
+        session = requests.Session()
+        response = session.get(DB_CLIENTS_URL, timeout=30)
+        response.raise_for_status()
+        login_html = response.text
+    except Exception as exc:
+        add_log(f"Ошибка подключения к БД: не удалось открыть страницу ({exc})")
+        st.error("Не удалось открыть страницу БД.")
+        return pd.DataFrame()
+
+    progress_bar.progress(25)
+    status_placeholder.info("Шаг 2/5: подготавливаем форму входа...")
+
+    form_blocks = re.findall(r"<form[\s\S]*?</form>", login_html, flags=re.IGNORECASE)
+    login_form = next((frm for frm in form_blocks if re.search(r'type\s*=\s*["\']password["\']', frm, flags=re.IGNORECASE)), None)
+    if login_form is None and form_blocks:
+        login_form = form_blocks[0]
+
+    if login_form is None:
+        add_log("Ошибка подключения к БД: не найдена форма авторизации")
+        st.error("На странице не найдена форма авторизации.")
+        return pd.DataFrame()
+
+    form_tag_match = re.search(r"<form[^>]*>", login_form, flags=re.IGNORECASE)
+    form_tag = form_tag_match.group(0) if form_tag_match else ""
+    action = _extract_attr(form_tag, "action") or DB_CLIENTS_URL
+    login_url = urljoin(DB_CLIENTS_URL, action)
+
+    payload: dict[str, str] = {}
+    username_field = None
+    password_field = None
+
+    input_tags = re.findall(r"<input[^>]*>", login_form, flags=re.IGNORECASE)
+    for tag in input_tags:
+        name = _extract_attr(tag, "name")
+        if not name:
+            continue
+        input_type = (_extract_attr(tag, "type") or "text").lower()
+        value = _extract_attr(tag, "value") or ""
+
+        if input_type == "hidden":
+            payload[name] = value
+        if input_type == "password" and password_field is None:
+            password_field = name
+        if input_type in {"text", "email"} and username_field is None:
+            username_field = name
+
+    if username_field is None:
+        for candidate in ("username", "login", "user", "email"):
+            if candidate in payload or re.search(rf'name\s*=\s*["\']{candidate}["\']', login_form, flags=re.IGNORECASE):
+                username_field = candidate
+                break
+    if password_field is None:
+        for candidate in ("password", "pass", "passwd"):
+            if candidate in payload or re.search(rf'name\s*=\s*["\']{candidate}["\']', login_form, flags=re.IGNORECASE):
+                password_field = candidate
+                break
+
+    username_field = username_field or "username"
+    password_field = password_field or "password"
+    payload[username_field] = DB_LOGIN
+    payload[password_field] = DB_PASSWORD
+
+    progress_bar.progress(50)
+    status_placeholder.info("Шаг 3/5: выполняем авторизацию...")
+
+    try:
+        auth_response = session.post(login_url, data=payload, timeout=30)
+        auth_response.raise_for_status()
+    except Exception as exc:
+        add_log(f"Ошибка подключения к БД: не удалось выполнить вход ({exc})")
+        st.error("Не удалось выполнить вход в БД.")
+        return pd.DataFrame()
+
+    progress_bar.progress(75)
+    status_placeholder.info("Шаг 4/5: загружаем таблицу клиентов...")
+
+    try:
+        clients_response = session.get(DB_CLIENTS_URL, timeout=60)
+        clients_response.raise_for_status()
+        html_text = clients_response.text
+    except Exception as exc:
+        add_log(f"Ошибка подключения к БД: не удалось загрузить таблицу ({exc})")
+        st.error("Не удалось загрузить страницу таблицы клиентов.")
+        return pd.DataFrame()
+
+    class _MemoryFile:
+        def __init__(self, content: bytes) -> None:
+            self._content = content
+
+        def getvalue(self) -> bytes:
+            return self._content
+
+    df = load_table(_MemoryFile(html_text.encode("utf-8", errors="ignore")))
+    if not df.empty:
+        add_log(f"Подключение к БД успешно: загружено строк {len(df)}")
+
+    progress_bar.progress(100)
+    status_placeholder.success("Шаг 5/5: загрузка завершена")
+    return df
 
 
 def init_logs() -> None:
@@ -419,15 +545,23 @@ def main() -> None:
     init_logs()
 
     uploaded_file = st.file_uploader("Загрузка HTML файла", type=["html", "htm"])
+    connect_db_clicked = st.button("Подключиться к БД")
 
-    if not uploaded_file:
-        st.info("Ожидается загрузка HTML-файла с клиентской таблицей.")
-        with st.expander("Логи"):
-            st.text("\n".join(st.session_state.logs) if st.session_state.logs else "Логи пока пусты")
-        return
+    if connect_db_clicked:
+        progress_bar = st.progress(0)
+        status_placeholder = st.empty()
+        df_from_db = fetch_table_from_db(progress_bar, status_placeholder)
+        if not df_from_db.empty:
+            st.session_state.df_from_db = df_from_db
 
-    df = load_table(uploaded_file)
+    df = pd.DataFrame()
+    if uploaded_file:
+        df = load_table(uploaded_file)
+    elif "df_from_db" in st.session_state:
+        df = st.session_state.df_from_db.copy()
+
     if df.empty:
+        st.info("Загрузите HTML-файл или нажмите 'Подключиться к БД'.")
         with st.expander("Логи"):
             st.text("\n".join(st.session_state.logs) if st.session_state.logs else "Логи пока пусты")
         return
