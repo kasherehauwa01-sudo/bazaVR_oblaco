@@ -368,7 +368,7 @@ def main() -> None:
         st.warning("Экспорт XLSX временно недоступен: не найдены движки openpyxl/xlsxwriter.")
     else:
         st.download_button(
-            label="Скачать xlsx",
+            label="скачать xlsx",
             data=xlsx_data,
             file_name="filtered_clients.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
