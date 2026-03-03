@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 from io import BytesIO
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
+import re
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,8 @@ INN_TO_DEPARTMENT = {
     "231113584561": "ИП Титаренко О.А.",
     "3445106455": "ООО Уютайм",
 }
+
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 
 class _SimpleHTMLTableParser(HTMLParser):
@@ -169,6 +172,25 @@ def load_table(file_obj) -> pd.DataFrame:
     add_log("Ошибка чтения HTML: подходящая таблица с нужными колонками не найдена")
     st.error("В файле не найдена таблица с обязательными колонками.")
     return pd.DataFrame()
+
+
+def sanitize_email_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Очищает невалидные email в колонке Почта (заменяет на пустую строку)."""
+    result = df.copy()
+
+    def normalize_email(value: object) -> str:
+        text = str(value).strip()
+        if text.lower() in {"", "nan", "none"}:
+            return ""
+        return text if EMAIL_PATTERN.match(text) else ""
+
+    before_non_empty = result["Почта"].astype(str).str.strip().replace({"nan": "", "None": ""}).ne("").sum()
+    result["Почта"] = result["Почта"].apply(normalize_email)
+    after_non_empty = result["Почта"].astype(str).str.strip().ne("").sum()
+    cleared = int(before_non_empty - after_non_empty)
+    if cleared > 0:
+        add_log(f"Очистка Email: удалено невалидных значений {cleared}")
+    return result
 
 
 def build_department(df: pd.DataFrame) -> pd.DataFrame:
@@ -410,6 +432,7 @@ def main() -> None:
             st.text("\n".join(st.session_state.logs) if st.session_state.logs else "Логи пока пусты")
         return
 
+    df = sanitize_email_column(df)
     df = build_department(df)
 
     st.subheader("Фильтры")
